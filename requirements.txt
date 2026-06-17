@@ -1,0 +1,8 @@
+fastapi==0.111.0        # web framework — routing, dependency injection, auto OpenAPI docs
+uvicorn[standard]==0.29.0  # ASGI (Asynchronous Server Gateway Interface) server to run the FastAPI app; [standard] adds websocket/reload support
+sqlmodel==0.0.19        # ORM combining SQLAlchemy + Pydantic — defines DB models as Python classes
+pydantic==2.7.1         # data validation and serialisation for request/response schemas
+
+# Week 2 additions (uncomment when you get there)
+psycopg2-binary==2.9.9  # PostgreSQL driver for SQLAlchemy/SQLModel
+alembic==1.13.1          # DB migration tool — tracks and applies schema changes

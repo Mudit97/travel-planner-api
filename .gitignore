@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Environments
+.venv/
+env/
+
+# Virtualenv and pipenv
+Pipfile.lock
+
+# VS Code
+.vscode/
+
+# SQLite DB
+travel_planner.db
+
+# Alembic versions (optional)
+# alembic/versions/
+
+# OS files
+.DS_Store
+
+# dotenv
+.env
+
