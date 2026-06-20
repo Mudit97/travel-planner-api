@@ -217,44 +217,181 @@ ECS Cluster
 - **Service**: keeps N copies of a task running, restarts on failure
 - **Task**: a running instance of the task definition (= a container)
 
-### Create a Task Definition
+### Architecture note: arm64 vs amd64
 
-1. ECS → **Task definitions** → **Create new task definition**
-2. Launch type: **EC2**
-3. Task name: `travel-planner-task`
-4. Task role: create/select a role with ECR pull + CloudWatch logs permissions
-5. Container:
-   - Name: `travel-api`
-   - Image URI: `<ecr-uri>:latest`
-   - Port mapping: 8000 → 8000
-   - Environment variables:
-     - `DATABASE_URL` = `postgresql://travel_user:<pw>@<rds-endpoint>:5432/travel_planner`
-6. CPU: 256 (.25 vCPU), Memory: 512 MB
-
-### Create a Cluster + Service
+If you're on an Apple Silicon Mac (M1/M2/M3), Docker builds `arm64` images by default. ECS EC2 instances run `amd64` (x86_64). You must rebuild for the correct architecture before pushing:
 
 ```bash
-# Create cluster (EC2 launch type with one t2.micro)
-aws ecs create-cluster --cluster-name travel-planner-cluster
+# Re-authenticate to ECR first (token expires after 12h)
+aws ecr get-login-password --region ap-south-1 \
+  | docker login --username AWS \
+    --password-stdin \
+    059674821864.dkr.ecr.ap-south-1.amazonaws.com
 
-# Register the task definition (via console or JSON)
-# Then create a service:
-aws ecs create-service \
+# Build for amd64 and push directly to ECR
+docker buildx build --platform linux/amd64 \
+  -t 059674821864.dkr.ecr.ap-south-1.amazonaws.com/travel-planner-api:latest \
+  --push \
+  .
+```
+
+If `buildx` isn't set up: `docker buildx create --use` then re-run the build command.
+
+### Step 1 — Create IAM instance profile (ecsInstanceRole)
+
+EC2 instances in an ECS cluster need an IAM role so the ECS agent can authenticate with ECS and pull images from ECR.
+
+IAM → Roles → **Create role**:
+- Trusted entity: **EC2**
+- Policy: `AmazonEC2ContainerServiceforEC2Role`
+- Role name: `ecsInstanceRole`
+
+### Step 2 — Create the ECS Cluster
+
+ECS → Clusters → **Create cluster**:
+- Cluster name: `travel-planner-cluster`
+- Infrastructure: **Fargate and self-managed instances** (shows EC2 configuration options)
+- With self-managed instances, AWS does NOT launch EC2 instances for you — you launch them manually and they register themselves to the cluster via the ECS agent.
+
+### Step 3 — Launch the EC2 instance
+
+EC2 → **Launch Instance**:
+
+| Field | Value |
+|---|---|
+| Name | `travel-ecs-instance` |
+| AMI | Amazon Linux 2 |
+| Instance type | `t2.micro` (free tier) |
+| Key pair | Create new → `travel-planner-key`, ED25519, `.pem` |
+| Security group | Use the one with port 8000 + port 22 open inbound |
+| IAM instance profile | `ecsInstanceRole` |
+
+In **Advanced details → User data** (critical — tells the instance which cluster to join):
+```bash
+#!/bin/bash
+echo ECS_CLUSTER=travel-planner-cluster >> /etc/ecs/ecs.config
+```
+
+Save the `.pem` key file to `~/.ssh/` and restrict permissions:
+```bash
+mkdir -p ~/.ssh
+mv ~/Downloads/travel-planner-key.pem ~/.ssh/travel-planner-key.pem
+chmod 400 ~/.ssh/travel-planner-key.pem
+```
+
+`chmod 400` — owner read-only, no access for group/others. SSH refuses to use a key file that others can read.
+
+### Step 4 — Verify instance registered to cluster
+
+**ECS → Clusters → travel-planner-cluster → Infrastructure tab** — instance should appear within 1-2 minutes.
+
+If the instance doesn't appear, SSH in and check:
+```bash
+ssh -i ~/.ssh/travel-planner-key.pem ec2-user@<public-ip>
+
+# Check if ECS agent is running
+sudo systemctl status ecs
+
+# Check/set the cluster config
+cat /etc/ecs/ecs.config
+
+# If file is missing or empty:
+echo ECS_CLUSTER=travel-planner-cluster | sudo tee /etc/ecs/ecs.config
+sudo systemctl restart ecs
+```
+
+### Step 5 — Open port 8000 on the EC2 security group
+
+The EC2 instance's security group needs inbound port 8000 so traffic from the internet reaches the container.
+
+EC2 → Security Groups → the group attached to `travel-ecs-instance` → **Edit inbound rules → Add rule**:
+
+| Type | Port | Source |
+|---|---|---|
+| Custom TCP | 8000 | 0.0.0.0/0 |
+| SSH | 22 | My IP |
+
+Also add the ECS security group ID as an inbound source in the **RDS security group** on port 5432, so ECS containers can reach RDS:
+
+| Type | Port | Source |
+|---|---|---|
+| PostgreSQL | 5432 | `<ecs-instance-security-group-id>` |
+
+### Step 6 — Create the Task Definition
+
+ECS → Task definitions → **Create new task definition**:
+
+| Field | Value |
+|---|---|
+| Task definition name | `travel-planner-task` |
+| Launch type | EC2 |
+| OS/Architecture | Linux/X86_64 |
+| Network mode | bridge |
+| Task CPU | 0.25 vCPU |
+| Task memory | 0.5 GB |
+
+Container - 1:
+
+| Field | Value |
+|---|---|
+| Name | `travel-api` |
+| Essential | Yes |
+| Image URI | `059674821864.dkr.ecr.ap-south-1.amazonaws.com/travel-planner-api:latest` |
+| Container port | 8000 / tcp |
+| Port name | (leave blank) |
+| App protocol | (leave blank) |
+
+Environment variables:
+```
+DATABASE_URL = postgresql://travel_user:<password>@travel-planner-db-1.c10460ausu7b.ap-south-1.rds.amazonaws.com:5432/travel_planner?sslmode=require
+```
+
+`?sslmode=require` is mandatory — RDS rejects unencrypted connections by default.
+
+### Step 7 — Create the ECS Service
+
+ECS → Clusters → travel-planner-cluster → Services → **Create**:
+
+| Field | Value |
+|---|---|
+| Launch type | EC2 |
+| Task definition | `travel-planner-task` (latest) |
+| Service name | `travel-api-service` |
+| Desired tasks | 1 |
+
+### Step 8 — Verify
+
+**ECS → Clusters → travel-planner-cluster → Services → travel-api-service → Tasks tab** — task should show **RUNNING**.
+
+If the task fails (Deployment Circuit Breaker triggered), click the stopped task → Logs tab to read the error. Common causes:
+- Wrong password in `DATABASE_URL` → create a new task definition revision with the correct password
+- Missing `?sslmode=require` → update `DATABASE_URL` in a new revision
+- Port 8000 not open on EC2 security group
+
+Once RUNNING, hit Swagger:
+```
+http://<ec2-public-ip>:8000/docs
+```
+
+### Updating the deployment
+
+When you push a new image to ECR:
+```bash
+# 1. Build and push
+docker buildx build --platform linux/amd64 \
+  -t 059674821864.dkr.ecr.ap-south-1.amazonaws.com/travel-planner-api:latest \
+  --push .
+
+# 2. Force ECS to restart the task with the new image
+aws ecs update-service \
   --cluster travel-planner-cluster \
-  --service-name travel-api-service \
-  --task-definition travel-planner-task \
-  --desired-count 1 \
-  --launch-type EC2
+  --service travel-api-service \
+  --force-new-deployment
 ```
 
-### Verify
-
-```bash
-aws ecs list-tasks --cluster travel-planner-cluster
-aws ecs describe-tasks --cluster travel-planner-cluster --tasks <task-arn>
-```
-
-Hit `http://<ec2-public-ip>:8000/docs` — Swagger UI should load.
+When you update environment variables (e.g. DATABASE_URL):
+- ECS → Task Definitions → travel-planner-task → **Create new revision** → update env var → save
+- ECS → Services → travel-api-service → **Update** → select new revision → save
 
 ---
 

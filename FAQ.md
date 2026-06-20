@@ -346,6 +346,101 @@ The region you set in `aws configure` (or `aws configure set region ap-south-1`)
 
 ---
 
+**Q: What is the difference between Fargate, managed instances, and self-managed instances in ECS?**
+
+ECS gives you three ways to provide compute capacity for your containers:
+
+| Mode | Who launches instances | Who patches/scales | Free tier |
+|---|---|---|---|
+| **Fargate** | AWS | AWS | No |
+| **Managed instances** | AWS (Auto Scaling Group) | AWS | Yes (t2.micro) |
+| **Self-managed instances** | You | You | Yes (t2.micro) |
+
+Self-managed means you launch EC2 instances manually and they register themselves to the ECS cluster via the ECS agent. You control exactly which instances exist. For production you'd use managed instances or Fargate (auto-scaling). For learning, self-managed is fine but requires more manual steps.
+
+---
+
+**Q: What is the ECS agent and why does the EC2 instance need it?**
+
+The ECS agent is a daemon process that runs on each EC2 instance in an ECS cluster. It is responsible for:
+- Registering the instance with the ECS cluster
+- Receiving instructions from ECS (start this container, stop that one)
+- Reporting task status back to ECS (running, stopped, CPU/memory usage)
+
+Without the ECS agent running, the EC2 instance is just a plain VM — ECS has no way to place containers on it. Amazon Linux 2 includes the ECS agent pre-installed. The agent reads `/etc/ecs/ecs.config` to know which cluster to join — that's why the user data script is critical.
+
+---
+
+**Q: What is an IAM instance profile and why does the ECS EC2 instance need one?**
+
+An IAM instance profile is a container that holds an IAM role and attaches it to an EC2 instance. When software running on the instance (like the ECS agent) makes AWS API calls, it automatically uses the role's permissions — no access keys needed on the instance.
+
+The `ecsInstanceRole` with `AmazonEC2ContainerServiceforEC2Role` policy lets the ECS agent:
+- Register the instance with the ECS cluster
+- Pull container images from ECR
+- Write logs to CloudWatch
+
+Without this role, the ECS agent starts but fails to authenticate with AWS — the instance never appears in the cluster's Infrastructure tab.
+
+---
+
+**Q: Why does `ssh` refuse to connect with an error about unprotected private key?**
+
+SSH enforces that private key files are readable only by the owner. If group or others have read access (`-rw-r--r--`), SSH prints:
+
+```
+WARNING: UNPROTECTED PRIVATE KEY FILE!
+Permissions 0644 for 'travel-planner-key.pem' are too open.
+```
+
+And refuses to connect. Fix with:
+```bash
+chmod 400 ~/.ssh/travel-planner-key.pem
+```
+
+`400` in octal: owner = read (4), group = none (0), others = none (0). SSH then accepts the key.
+
+---
+
+**Q: Why `?sslmode=require` in the DATABASE_URL for RDS?**
+
+RDS PostgreSQL rejects unencrypted connections by default. Without `?sslmode=require`, the connection attempt produces:
+
+```
+FATAL: no pg_hba.conf entry for host "x.x.x.x", user "travel_user", database "travel_planner", no encryption
+```
+
+`pg_hba.conf` is PostgreSQL's client authentication config. On RDS, AWS configures it to require SSL from external connections. Adding `?sslmode=require` to the connection URL tells psycopg2 to negotiate a TLS connection, which satisfies the RDS requirement.
+
+For local Docker Compose (where SSL isn't configured), omit `?sslmode=require` — it will cause a connection error against a plain Postgres container.
+
+---
+
+**Q: What is a task definition revision in ECS?**
+
+Every time you save changes to a task definition, ECS creates a new **revision** — an immutable, versioned snapshot. Revisions are numbered: `travel-planner-task:1`, `travel-planner-task:2`, etc.
+
+You cannot edit an existing revision. To change an environment variable or image tag, you create a new revision, then update the service to point to it. ECS services default to `latest` (highest revision number) when no revision is specified.
+
+This versioning means you can always roll back to a previous revision if a new deployment breaks.
+
+---
+
+**Q: What is arm64 vs amd64 and why does it matter for Docker?**
+
+- `amd64` (also called `x86_64`): the architecture used by Intel/AMD processors — all standard cloud servers, including EC2 instances
+- `arm64` (also called `aarch64`): the architecture used by Apple Silicon (M1/M2/M3) and AWS Graviton instances
+
+Docker images are architecture-specific. An `arm64` image built on a Mac will not run on an `amd64` EC2 instance — the container will fail to start silently.
+
+When deploying to standard EC2 instances from an Apple Silicon Mac, always build explicitly for `amd64`:
+
+```bash
+docker buildx build --platform linux/amd64 -t <image-name> --push .
+```
+
+---
+
 **Q: What is a pre-signed URL in S3?**
 
 S3 objects are private by default. A pre-signed URL is a time-limited URL that grants temporary read (or write) access to a specific object without making the bucket public.
